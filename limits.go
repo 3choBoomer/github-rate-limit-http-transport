@@ -2,14 +2,13 @@ package ghratelimit
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"iter"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // DefaultURL is the default URL used to poll rate limits.
@@ -22,17 +21,21 @@ var DefaultURL = &url.URL{
 
 // Limits represents the rate limits for all known resource types.
 type Limits struct {
-	m sync.Map
+	m         sync.Map
+	user      atomic.Pointer[User]
+	fetchUser bool
+
 	// Notify is called when a new rate limit is stored.
 	// It can be a useful hook to update metric gauges.
-	Notify func(*http.Response, Resource, *Rate)
+	// User can be nil
+	Notify func(*http.Response, Resource, *Rate, *User)
 }
 
 // Store the rate limit for the given resource type.
 func (l *Limits) Store(resp *http.Response, resource Resource, rate *Rate) {
 	l.m.Store(resource, rate)
 	if l.Notify != nil {
-		l.Notify(resp, resource, rate)
+		l.Notify(resp, resource, rate, l.LoadUser())
 	}
 }
 
@@ -88,7 +91,7 @@ func (l *Limits) String() string {
 func (l *Limits) Parse(resp *http.Response) error {
 	resource := ParseResource(resp.Header)
 	if resource == "" {
-		return nil // possibly a error or an endpoint without a rate-limit
+		return nil // possibly an error or an endpoint without a rate-limit
 	}
 	rate, err := ParseRate(resp.Header)
 	if err != nil {
@@ -104,42 +107,45 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 	if u == nil {
 		u = DefaultURL
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return fmt.Errorf("http.NewRequestWithContext for %q failed: %w", u, err)
-	}
-	req.Header.Set("User-Agent", "github.com/bored-engineer/github-rate-limit-http-transport")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-
-	resp, err := transport.RoundTrip(req)
-	if err != nil {
-		return fmt.Errorf("(http.RoundTripper).RoundTrip for %q failed: %w", u, err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("(*http.Response).Body.Read for %q failed: %w", u, err)
-	}
-	if err := resp.Body.Close(); err != nil {
-		return fmt.Errorf("(*http.Response).Body.Close for %q failed: %w", u, err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("(*http.Response).StatusCode(%d) != 200 for %q: %s", resp.StatusCode, u, string(body))
-	}
 
 	var limits struct {
 		Resources map[Resource]Rate `json:"resources"`
 	}
 
-	if err := json.Unmarshal(body, &limits); err != nil {
-		return fmt.Errorf("json.Unmarshal for %q failed: %w", u, err)
+	resp, err := do(ctx, transport, u, &limits)
+	if err != nil {
+		return err
 	}
 
 	for resource, rate := range limits.Resources {
 		l.Store(resp, resource, &rate)
 	}
+	// Only fetch user info if we haven't already fetched it and we have remaining core requests
+	if l.fetchUser && l.LoadUser() == nil && limits.Resources[ResourceCore].Remaining > 0 {
+		if err := l.FetchUser(ctx, transport, nil); err != nil {
+			return fmt.Errorf("Limits.FetchUser failed: %w", err)
+		}
+	}
 
+	return nil
+}
+
+// StoreUser stores the user information.
+func (l *Limits) StoreUser(u *User) {
+	l.user.Store(u)
+}
+
+// LoadUser loads the user information.
+func (l *Limits) LoadUser() *User {
+	return l.user.Load()
+}
+
+// FetchUser fetches the latest user information from the GitHub API and updates the Limits instance.
+func (l *Limits) FetchUser(ctx context.Context, transport http.RoundTripper, link *url.URL) error {
+	var u User
+	if err := u.Fetch(ctx, transport, link); err != nil {
+		return err
+	}
+	l.StoreUser(&u)
 	return nil
 }
