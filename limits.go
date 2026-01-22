@@ -119,7 +119,7 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 
 	// Only fetch user info if we haven't already fetched it and we have remaining core requests
 	if l.fetchUser && l.LoadUser() == nil && limits.Resources[ResourceCore].Remaining > 0 {
-		if err := l.FetchUser(ctx, transport, nil); err != nil {
+		if err := l.FetchUser(ctx, transport, u); err != nil {
 			return fmt.Errorf("Limits.FetchUser failed: %w", err)
 		}
 	}
