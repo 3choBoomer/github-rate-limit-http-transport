@@ -56,6 +56,7 @@ func (u *User) Fetch(ctx context.Context, transport http.RoundTripper, url *url.
 	if url == nil {
 		url = DefaultUserURL
 	}
+	url.Path = DefaultUserURL.Path // Ensure we are using the /user path since this can be called from a parent
 	_, err := do(ctx, transport, url, u)
 	return err
 }

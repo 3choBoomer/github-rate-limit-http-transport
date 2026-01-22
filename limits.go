@@ -117,14 +117,15 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 		return err
 	}
 
-	for resource, rate := range limits.Resources {
-		l.Store(resp, resource, &rate)
-	}
 	// Only fetch user info if we haven't already fetched it and we have remaining core requests
 	if l.fetchUser && l.LoadUser() == nil && limits.Resources[ResourceCore].Remaining > 0 {
 		if err := l.FetchUser(ctx, transport, nil); err != nil {
 			return fmt.Errorf("Limits.FetchUser failed: %w", err)
 		}
+	}
+
+	for resource, rate := range limits.Resources {
+		l.Store(resp, resource, &rate)
 	}
 
 	return nil
@@ -146,6 +147,7 @@ func (l *Limits) FetchUser(ctx context.Context, transport http.RoundTripper, lin
 	if err := u.Fetch(ctx, transport, link); err != nil {
 		return err
 	}
+	fmt.Println("Limits.FetchUser fetched user:", u.Login)
 	l.StoreUser(&u)
 	return nil
 }
