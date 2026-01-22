@@ -16,6 +16,9 @@ type Transport struct {
 	Base http.RoundTripper
 	// Limits is the most recent rate-limit information
 	Limits Limits
+	// userLoginHeader is the header key used to add the user login to the response.
+	// If empty, the header is not added.
+	userLoginHeader string
 }
 
 // Option configures the Transport
@@ -46,6 +49,19 @@ func WithFetchUser(fetch bool) Option {
 	}
 }
 
+// WithUserLoginHeader configures the Transport to add the user login to the response headers.
+// The provided string overrides the header key. If no string or an empty string is provided,
+// the default key "X-GitHub-User-Login" is used.
+func WithUserLoginHeader(headerKey string) Option {
+	return func(t *Transport) {
+		if headerKey != "" {
+			t.userLoginHeader = headerKey
+		} else {
+			t.userLoginHeader = "X-GitHub-User-Login"
+		}
+	}
+}
+
 // RoundTrip implements http.RoundTripper
 func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	if t.Base == nil {
@@ -57,8 +73,15 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 		if err := t.Limits.Parse(resp); err != nil {
 			return nil, err
 		}
+		if t.userLoginHeader != "" {
+			user := t.Limits.LoadUser()
+			if user != nil && user.Login != nil {
+				// We are ADDing user to the response headers since this request may be retried
+				resp.Header.Add(t.userLoginHeader, *user.Login)
+			}
+		}
 	}
-	return
+	return resp, err
 }
 
 // Poll calls (*Transport).Limits.Update every interval, starting immediately.
