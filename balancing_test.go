@@ -369,13 +369,13 @@ func TestStrategy_BestTransportByRemainingAndReset(t *testing.T) {
 			name:          "both in past, candidate is older",
 			bestRate:      &Rate{Remaining: 0, Reset: uint64(past.Unix())},
 			candidateRate: &Rate{Remaining: 0, Reset: uint64(olderPast.Unix())},
-			wantNil:       true,
+			wantCandidate: true,
 		},
 		{
 			name:          "both in past, best is older",
 			bestRate:      &Rate{Remaining: 0, Reset: uint64(olderPast.Unix())},
 			candidateRate: &Rate{Remaining: 0, Reset: uint64(past.Unix())},
-			wantNil:       true,
+			wantCandidate: false,
 		},
 		{
 			name:          "best is nil, candidate has 0 remaining and future reset",
@@ -385,9 +385,9 @@ func TestStrategy_BestTransportByRemainingAndReset(t *testing.T) {
 		},
 		{
 			name:          "both zero remaining and future resets",
-			bestRate:      &Rate{Remaining: 0, Reset: uint64(future.Unix())},
+			bestRate:      &Rate{Remaining: 0, Reset: uint64(future.Add(time.Minute).Unix())},
 			candidateRate: &Rate{Remaining: 0, Reset: uint64(future.Unix())},
-			wantNil:       true,
+			wantCandidate: true,
 		},
 		{
 			name:          "candidate reset in past, best in future (non-zero remaining)",
@@ -436,6 +436,12 @@ func TestStrategy_BestTransportByRemainingAndReset(t *testing.T) {
 			bestRate:      &Rate{Remaining: 5, Reset: uint64(future.Unix())},
 			candidateRate: &Rate{Remaining: 10, Reset: uint64(future.Add(30 * time.Minute).Unix())},
 			wantCandidate: false,
+		},
+		{
+			name:          "equal remaining above threshold, candidate resets sooner",
+			bestRate:      &Rate{Remaining: 80, Reset: uint64(future.Add(30 * time.Minute).Unix())},
+			candidateRate: &Rate{Remaining: 80, Reset: uint64(future.Unix())},
+			wantCandidate: true,
 		},
 	}
 
