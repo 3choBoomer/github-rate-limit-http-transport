@@ -18,7 +18,7 @@ type BalancingTransport struct {
 }
 
 type Responser interface {
-	GetResponse() *http.Response
+	GetResponse(req *http.Request) *http.Response
 }
 
 type GetTransportsExhaustedError func(req *http.Request, resource Resource, transports []*Transport) error
@@ -80,7 +80,7 @@ func (bt *BalancingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		if bt.getExhaustedError != nil {
 			errToReturn := bt.getExhaustedError(req, resource, bt.transports)
 			if responder, ok := errToReturn.(Responser); ok {
-				resp := responder.GetResponse()
+				resp := responder.GetResponse(req)
 				if resp != nil {
 					return resp, nil
 				}
