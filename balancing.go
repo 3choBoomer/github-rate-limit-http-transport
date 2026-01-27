@@ -12,16 +12,12 @@ import (
 // BalancingTransport distributes requests to the transport with the highest "remaining" rate limit to execute the request.
 // This can be used to distributes requests across multiple GitHub authentication tokens or applications.
 type BalancingTransport struct {
-	transports        []*Transport
-	strategy          func(resource Resource, currentBest *Transport, candidate *Transport) *Transport
-	getExhaustedError GetTransportsExhaustedError
+	transports                  []*Transport
+	strategy                    func(resource Resource, currentBest *Transport, candidate *Transport) *Transport
+	getExhaustedErrorOrResponse GetTransportsExhaustedErrorOrResponse
 }
 
-type Responser interface {
-	GetResponse(req *http.Request) *http.Response
-}
-
-type GetTransportsExhaustedError func(req *http.Request, resource Resource, transports []*Transport) error
+type GetTransportsExhaustedErrorOrResponse func(req *http.Request, resource Resource, transports []*Transport) (*http.Response, error)
 
 // BalancingOption configures the BalancingTransport
 type BalancingOption func(*BalancingTransport)
@@ -45,10 +41,10 @@ func WithStrategy(strategy func(resource Resource, currentBest *Transport, candi
 	}
 }
 
-// WithErrorOnTransportsExhausted provide a function to return back a custom error when all transports are exhausted.
-func WithErrorOnTransportsExhausted(errFunc GetTransportsExhaustedError) BalancingOption {
+// WithErrorOrResponseOnTransportsExhausted provide a function to return back a custom error when all transports are exhausted.
+func WithErrorOrResponseOnTransportsExhausted(errFunc GetTransportsExhaustedErrorOrResponse) BalancingOption {
 	return func(bt *BalancingTransport) {
-		bt.getExhaustedError = errFunc
+		bt.getExhaustedErrorOrResponse = errFunc
 	}
 }
 
@@ -77,15 +73,8 @@ func (bt *BalancingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	}
 
 	if bestTransport == nil {
-		if bt.getExhaustedError != nil {
-			errToReturn := bt.getExhaustedError(req, resource, bt.transports)
-			if responder, ok := errToReturn.(Responser); ok {
-				resp := responder.GetResponse(req)
-				if resp != nil {
-					return resp, nil
-				}
-			}
-			return nil, errToReturn
+		if bt.getExhaustedErrorOrResponse != nil {
+			return bt.getExhaustedErrorOrResponse(req, resource, bt.transports)
 		}
 		bestTransport = bt.transports[rand.Intn(len(bt.transports))]
 	}

@@ -243,16 +243,19 @@ func TestNewBalancingTransport(t *testing.T) {
 		}
 	})
 
-	getEarliestReset := func(req *http.Request, resource Resource, transports []*Transport) error {
-		earliestReset := time.Now().Add(5 * time.Hour).Unix()
-		for _, transport := range transports {
-			if limits := transport.Limits.Load(resource); limits != nil {
+	getEarliestResetError := func(req *http.Request, resource Resource, transports []*Transport) (*http.Response, error) {
+		var earliestReset int64
+		for _, t := range transports {
+			if limits := t.Limits.Load(resource); limits != nil {
+				if earliestReset == 0 {
+					earliestReset = int64(limits.Reset)
+				}
 				if limits.Reset > 0 && int64(limits.Reset) < earliestReset {
 					earliestReset = int64(limits.Reset)
 				}
 			}
 		}
-		return &exhaustedWithReset{msg: "no transport available", earliestReset: time.Unix(earliestReset, 0)}
+		return nil, &exhaustedWithReset{msg: "no transport available", earliestReset: time.Unix(earliestReset, 0)}
 	}
 
 	t.Run("returns configured error when strategy yields nil", func(t *testing.T) {
@@ -264,7 +267,7 @@ func TestNewBalancingTransport(t *testing.T) {
 		m := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
 		bt := NewBalancingTransport([]*Transport{NewTransport(m)},
 			WithStrategy(strategy),
-			WithErrorOnTransportsExhausted(getEarliestReset))
+			WithErrorOrResponseOnTransportsExhausted(getEarliestResetError))
 
 		req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
 		_, err := bt.RoundTrip(req)
@@ -278,10 +281,12 @@ func TestNewBalancingTransport(t *testing.T) {
 
 	t.Run("returns nil error when exhausted handler returns nil", func(t *testing.T) {
 		strategy := func(resource Resource, currentBest, candidate *Transport) *Transport { return nil }
-		returnNil := func(req *http.Request, resource Resource, transports []*Transport) error { return nil }
+		returnNil := func(req *http.Request, resource Resource, transports []*Transport) (*http.Response, error) {
+			return nil, nil
+		}
 
 		m := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
-		bt := NewBalancingTransport([]*Transport{NewTransport(m)}, WithStrategy(strategy), WithErrorOnTransportsExhausted(returnNil))
+		bt := NewBalancingTransport([]*Transport{NewTransport(m)}, WithStrategy(strategy), WithErrorOrResponseOnTransportsExhausted(returnNil))
 
 		req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
 		resp, err := bt.RoundTrip(req)
@@ -307,7 +312,7 @@ func TestNewBalancingTransport(t *testing.T) {
 		errWithReset := &exhaustedWithReset{msg: "exhausted"}
 		strategy := func(resource Resource, currentBest, candidate *Transport) *Transport { return nil }
 
-		bt := NewBalancingTransport([]*Transport{t1, t2}, WithStrategy(strategy), WithErrorOnTransportsExhausted(getEarliestReset))
+		bt := NewBalancingTransport([]*Transport{t1, t2}, WithStrategy(strategy), WithErrorOrResponseOnTransportsExhausted(getEarliestResetError))
 
 		req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
 		_, err := bt.RoundTrip(req)
@@ -332,12 +337,12 @@ func TestNewBalancingTransport(t *testing.T) {
 	t.Run("returns response when exhausted error provides response", func(t *testing.T) {
 		strategy := func(resource Resource, currentBest, candidate *Transport) *Transport { return nil }
 		respFromError := &http.Response{StatusCode: 503}
-		exhaustedResponder := func(req *http.Request, resource Resource, transports []*Transport) error {
-			return &responderError{resp: respFromError}
+		exhaustedResponder := func(req *http.Request, resource Resource, transports []*Transport) (*http.Response, error) {
+			return respFromError, nil
 		}
 
 		m := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
-		bt := NewBalancingTransport([]*Transport{NewTransport(m)}, WithStrategy(strategy), WithErrorOnTransportsExhausted(exhaustedResponder))
+		bt := NewBalancingTransport([]*Transport{NewTransport(m)}, WithStrategy(strategy), WithErrorOrResponseOnTransportsExhausted(exhaustedResponder))
 
 		req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
 		gotResp, err := bt.RoundTrip(req)
@@ -351,8 +356,6 @@ func TestNewBalancingTransport(t *testing.T) {
 			t.Fatalf("expected underlying transport not to be used when exhausted response returned")
 		}
 	})
-
-	// ...existing code...
 }
 
 // exhaustedWithReset is a helper error that records the earliest reset time via SetEarliestReset.
@@ -364,13 +367,6 @@ type exhaustedWithReset struct {
 func (e *exhaustedWithReset) Error() string                { return e.msg }
 func (e *exhaustedWithReset) SetEarliestReset(t time.Time) { e.earliestReset = t }
 func (e *exhaustedWithReset) GetEarliestReset() time.Time  { return e.earliestReset }
-
-type responderError struct {
-	resp *http.Response
-}
-
-func (e *responderError) Error() string               { return "responder" }
-func (e *responderError) GetResponse() *http.Response { return e.resp }
 
 // Ensure mockRoundTripper implements http.RoundTripper
 var _ http.RoundTripper = &mockRoundTripper{}
