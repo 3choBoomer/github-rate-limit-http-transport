@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 // Rate represents the rate limit information for a given resource type.
@@ -20,7 +21,7 @@ type Rate struct {
 
 // String implements fmt.Stringer
 func (r *Rate) String() string {
-	return fmt.Sprintf("Rate{Limit: %d, Used: %d, Remaining: %d, Reset: %d}", r.Limit, r.Used, r.Remaining, r.Reset)
+	return fmt.Sprintf("Rate{Limit: %d, Used: %d, Remaining: %d, Reset: %s}", r.Limit, r.Used, r.Remaining, time.Unix(int64(r.Reset), 0).UTC().Format(time.RFC3339))
 }
 
 // Parse extracts the rate limit information from the HTTP response headers.

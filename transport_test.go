@@ -124,4 +124,45 @@ func TestTransport_RoundTrip(t *testing.T) {
 			t.Fatal("Poll did not call RoundTrip")
 		}
 	})
+
+	t.Run("poll multiple ticks", func(t *testing.T) {
+		calls := make(chan struct{}, 10)
+
+		base := &mockRoundTripper{
+			roundTripFunc: func(req *http.Request) (*http.Response, error) {
+				select {
+				case calls <- struct{}{}:
+				default:
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(bytes.NewBufferString(`{"resources":{}}`)),
+					Header:     http.Header{},
+				}, nil
+			},
+		}
+		tr := NewTransport(base)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		interval := 10 * time.Millisecond
+		go tr.Poll(ctx, interval, nil)
+
+		// Expect at least 3 calls:
+		// 1. Initial immediate call
+		// 2. First tick
+		// 3. Second tick
+		expectedCalls := 3
+		received := 0
+		timeout := time.After(100 * time.Millisecond)
+
+		for received < expectedCalls {
+			select {
+			case <-calls:
+				received++
+			case <-timeout:
+				t.Fatalf("timed out waiting for %d calls, got %d", expectedCalls, received)
+			}
+		}
+	})
 }

@@ -105,6 +105,15 @@ func StrategyResetTimeInPastAndMostRemaining(resource Resource, best, candidate 
 	bestRem, bestReset := extractValues(resource, best)
 	candidateRem, candidateReset := extractValues(resource, candidate)
 
+	// Prefer transports whose reset is already in the past
+	// relative to now because it will already have replenished tokens.
+	if resetIsInPastAndEarlierThanOther(candidateReset, bestReset) {
+		return candidate
+	}
+	if resetIsInPastAndEarlierThanOther(bestReset, candidateReset) {
+		return best
+	}
+
 	// if both transports have zero remaining tokens
 	// return the one that will reset first
 	if bestRem == 0 && candidateRem == 0 {
@@ -120,15 +129,6 @@ func StrategyResetTimeInPastAndMostRemaining(resource Resource, best, candidate 
 		return candidate
 	}
 	if bestRem > 0 && bestReset < candidateReset {
-		return best
-	}
-
-	// Prefer transports whose reset is already in the past
-	// relative to now because it will already have replenished tokens.
-	if resetIsInPastAndEarlierThanOther(candidateReset, bestReset) {
-		return candidate
-	}
-	if resetIsInPastAndEarlierThanOther(bestReset, candidateReset) {
 		return best
 	}
 
@@ -149,27 +149,6 @@ func extractValues(resource Resource, t *Transport) (uint64, int64) {
 		}
 	}
 	return 0, 0
-}
-
-// earliestResetTime returns the earliest non-zero reset time across transports for the resource.
-// If no reset times are available, it returns the zero time value.
-func earliestResetTime(resource Resource, transports []*Transport) time.Time {
-	var earliest time.Time
-	for _, t := range transports {
-		if t == nil {
-			continue
-		}
-		if r := t.Limits.Load(resource); r != nil {
-			if r.Reset == 0 {
-				continue
-			}
-			resetTime := time.Unix(int64(r.Reset), 0)
-			if earliest.IsZero() || resetTime.Before(earliest) {
-				earliest = resetTime
-			}
-		}
-	}
-	return earliest
 }
 
 // resetIsInPastAndEarlierThanOther returns true when `reset` is non-zero, already in the past
