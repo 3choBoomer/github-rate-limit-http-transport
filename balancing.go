@@ -9,22 +9,19 @@ import (
 	"time"
 )
 
-// TransportsExhaustedError allows callers to receive the earliest reset time when all transports are exhausted.
-type TransportsExhaustedError interface {
-	error
-	SetEarliestReset(time.Time)
-	GetEarliestReset() time.Time
-	Is(error) bool
-	As(any) bool
-}
-
 // BalancingTransport distributes requests to the transport with the highest "remaining" rate limit to execute the request.
 // This can be used to distributes requests across multiple GitHub authentication tokens or applications.
 type BalancingTransport struct {
-	transports   []*Transport
-	strategy     func(resource Resource, currentBest *Transport, candidate *Transport) *Transport
-	exhaustedErr TransportsExhaustedError // returned when strategy yields nil and WithErrorOnTransportsExhausted is set
+	transports        []*Transport
+	strategy          func(resource Resource, currentBest *Transport, candidate *Transport) *Transport
+	getExhaustedError GetTransportsExhaustedError
 }
+
+type Responser interface {
+	GetResponse() *http.Response
+}
+
+type GetTransportsExhaustedError func(req *http.Request, resource Resource, transports []*Transport) error
 
 // BalancingOption configures the BalancingTransport
 type BalancingOption func(*BalancingTransport)
@@ -48,10 +45,10 @@ func WithStrategy(strategy func(resource Resource, currentBest *Transport, candi
 	}
 }
 
-// WithErrorOnTransportsExhausted configures an error to return when the strategy cannot select a viable transport.
-func WithErrorOnTransportsExhausted(err TransportsExhaustedError) BalancingOption {
+// WithErrorOnTransportsExhausted provide a function to return back a custom error when all transports are exhausted.
+func WithErrorOnTransportsExhausted(errFunc GetTransportsExhaustedError) BalancingOption {
 	return func(bt *BalancingTransport) {
-		bt.exhaustedErr = err
+		bt.getExhaustedError = errFunc
 	}
 }
 
@@ -80,9 +77,15 @@ func (bt *BalancingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	}
 
 	if bestTransport == nil {
-		if bt.exhaustedErr != nil {
-			bt.exhaustedErr.SetEarliestReset(earliestResetTime(resource, bt.transports))
-			return nil, bt.exhaustedErr
+		if bt.getExhaustedError != nil {
+			errToReturn := bt.getExhaustedError(req, resource, bt.transports)
+			if responder, ok := errToReturn.(Responser); ok {
+				resp := responder.GetResponse()
+				if resp != nil {
+					return resp, nil
+				}
+			}
+			return nil, errToReturn
 		}
 		bestTransport = bt.transports[rand.Intn(len(bt.transports))]
 	}
