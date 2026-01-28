@@ -3,6 +3,7 @@ package ghratelimit
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"testing"
@@ -241,7 +242,131 @@ func TestNewBalancingTransport(t *testing.T) {
 			t.Error("custom strategy was not used")
 		}
 	})
+
+	getEarliestResetError := func(req *http.Request, resource Resource, transports []*Transport) (*http.Response, error) {
+		var earliestReset int64
+		for _, t := range transports {
+			if limits := t.Limits.Load(resource); limits != nil {
+				if earliestReset == 0 {
+					earliestReset = int64(limits.Reset)
+				}
+				if limits.Reset > 0 && int64(limits.Reset) < earliestReset {
+					earliestReset = int64(limits.Reset)
+				}
+			}
+		}
+		return nil, &exhaustedWithReset{msg: "no transport available", earliestReset: time.Unix(earliestReset, 0)}
+	}
+
+	t.Run("returns configured error when strategy yields nil", func(t *testing.T) {
+		// strategy always returns nil to simulate exhaustion
+		strategy := func(resource Resource, currentBest, candidate *Transport) *Transport {
+			return nil
+		}
+
+		m := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
+		bt := NewBalancingTransport([]*Transport{NewTransport(m)},
+			WithStrategy(strategy),
+			WithErrorOrResponseOnTransportsExhausted(getEarliestResetError))
+
+		req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
+		_, err := bt.RoundTrip(req)
+		if err == nil {
+			t.Fatalf("expected error, got nil")
+		}
+		if err.Error() != "no transport available" {
+			t.Fatalf("got %v", err)
+		}
+	})
+
+	t.Run("returns nil error when exhausted handler returns nil", func(t *testing.T) {
+		strategy := func(resource Resource, currentBest, candidate *Transport) *Transport { return nil }
+		returnNil := func(req *http.Request, resource Resource, transports []*Transport) (*http.Response, error) {
+			return nil, nil
+		}
+
+		m := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
+		bt := NewBalancingTransport([]*Transport{NewTransport(m)}, WithStrategy(strategy), WithErrorOrResponseOnTransportsExhausted(returnNil))
+
+		req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
+		resp, err := bt.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+		if resp != nil {
+			t.Fatalf("expected nil response when exhausted handler returns nil, got %v", resp)
+		}
+	})
+
+	t.Run("sets earliest reset on exhausted error when supported", func(t *testing.T) {
+		now := time.Now()
+		earliest := now.Add(10 * time.Minute)
+		latest := now.Add(20 * time.Minute)
+
+		t1 := NewTransport(nil)
+		t1.Limits.Store(nil, ResourceCore, &Rate{Remaining: 0, Reset: uint64(latest.Unix())})
+
+		t2 := NewTransport(nil)
+		t2.Limits.Store(nil, ResourceCore, &Rate{Remaining: 0, Reset: uint64(earliest.Unix())})
+
+		errWithReset := &exhaustedWithReset{msg: "exhausted"}
+		strategy := func(resource Resource, currentBest, candidate *Transport) *Transport { return nil }
+
+		bt := NewBalancingTransport([]*Transport{t1, t2}, WithStrategy(strategy), WithErrorOrResponseOnTransportsExhausted(getEarliestResetError))
+
+		req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
+		_, err := bt.RoundTrip(req)
+		if err == nil {
+			t.Fatalf("expected error, got nil")
+		}
+		if err.Error() != "no transport available" {
+			t.Fatalf("expected wrapped exhausted error, got %v", err)
+		}
+		var exErr *exhaustedWithReset
+		if !errors.As(err, &exErr) {
+			t.Fatalf("expected wrapped exhausted error, got %v", err)
+		}
+		if exErr.earliestReset.IsZero() {
+			t.Fatalf("expected earliest reset to be set")
+		}
+		if exErr.earliestReset.Unix() != earliest.Unix() {
+			t.Fatalf("expected earliest reset %v, got %v", earliest, errWithReset.earliestReset)
+		}
+	})
+
+	t.Run("returns response when exhausted error provides response", func(t *testing.T) {
+		strategy := func(resource Resource, currentBest, candidate *Transport) *Transport { return nil }
+		respFromError := &http.Response{StatusCode: 503}
+		exhaustedResponder := func(req *http.Request, resource Resource, transports []*Transport) (*http.Response, error) {
+			return respFromError, nil
+		}
+
+		m := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
+		bt := NewBalancingTransport([]*Transport{NewTransport(m)}, WithStrategy(strategy), WithErrorOrResponseOnTransportsExhausted(exhaustedResponder))
+
+		req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
+		gotResp, err := bt.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+		if gotResp != respFromError {
+			t.Fatalf("expected response from exhausted error, got %v", gotResp)
+		}
+		if m.req != nil {
+			t.Fatalf("expected underlying transport not to be used when exhausted response returned")
+		}
+	})
 }
+
+// exhaustedWithReset is a helper error that records the earliest reset time via SetEarliestReset.
+type exhaustedWithReset struct {
+	earliestReset time.Time
+	msg           string
+}
+
+func (e *exhaustedWithReset) Error() string                { return e.msg }
+func (e *exhaustedWithReset) SetEarliestReset(t time.Time) { e.earliestReset = t }
+func (e *exhaustedWithReset) GetEarliestReset() time.Time  { return e.earliestReset }
 
 // Ensure mockRoundTripper implements http.RoundTripper
 var _ http.RoundTripper = &mockRoundTripper{}
@@ -253,159 +378,229 @@ func TestStrategy_BestTransportByRemainingAndReset(t *testing.T) {
 	olderPast := now.Add(-2 * time.Hour)
 
 	tests := []struct {
-		name          string
-		bestRate      *Rate
-		candidateRate *Rate
-		wantCandidate bool
-		wantNil       bool
+		name      string
+		rates     []*Rate
+		wantIndex int // -1 for nil
 	}{
 		{
-			name:          "best is nil (implied by execution flow usually, but simulated here via empty bestRate or just checking logic flow)",
-			bestRate:      nil, // Treat as nil transport or nil constants
-			candidateRate: &Rate{Remaining: 10, Reset: uint64(future.Unix())},
-			wantCandidate: true,
+			name:      "single candidate, future reset, capacity",
+			rates:     []*Rate{{Remaining: 10, Reset: uint64(future.Unix())}},
+			wantIndex: 0,
 		},
 		{
-			name:          "both future, candidate has more remaining",
-			bestRate:      &Rate{Remaining: 10, Reset: uint64(future.Unix())},
-			candidateRate: &Rate{Remaining: 20, Reset: uint64(future.Unix())},
-			wantCandidate: true,
+			name: "both future, second has more remaining",
+			rates: []*Rate{
+				{Remaining: 10, Reset: uint64(future.Unix())},
+				{Remaining: 20, Reset: uint64(future.Unix())},
+			},
+			wantIndex: 1,
 		},
 		{
-			name:          "both future, best has more remaining",
-			bestRate:      &Rate{Remaining: 20, Reset: uint64(future.Unix())},
-			candidateRate: &Rate{Remaining: 10, Reset: uint64(future.Unix())},
-			wantCandidate: false,
+			name: "both future, first has more remaining",
+			rates: []*Rate{
+				{Remaining: 20, Reset: uint64(future.Unix())},
+				{Remaining: 10, Reset: uint64(future.Unix())},
+			},
+			wantIndex: 0,
 		},
 		{
-			name:          "candidate reset in past, best in future",
-			bestRate:      &Rate{Remaining: 100, Reset: uint64(future.Unix())},
-			candidateRate: &Rate{Remaining: 0, Reset: uint64(past.Unix())}, // Even with 0 remaining, if reset is past, it might be preferred?
-			// Logic: candidateReset (past) < now AND candidateReset < currentReset (future). True.
-			wantCandidate: true,
+			name: "second reset in past, first in future",
+			rates: []*Rate{
+				{Remaining: 100, Reset: uint64(future.Unix())},
+				{Remaining: 0, Reset: uint64(past.Unix())},
+			},
+			wantIndex: 1,
 		},
 		{
-			name:          "best reset in past, candidate in future",
-			bestRate:      &Rate{Remaining: 0, Reset: uint64(past.Unix())},
-			candidateRate: &Rate{Remaining: 100, Reset: uint64(future.Unix())},
-			// Logic: candidate (future) < now is False.
-			// current (past) < now is True. current (past) < candidate (future) True.
-			wantCandidate: false, // returns best
+			name: "first reset in past, second in future",
+			rates: []*Rate{
+				{Remaining: 0, Reset: uint64(past.Unix())},
+				{Remaining: 100, Reset: uint64(future.Unix())},
+			},
+			wantIndex: 0,
 		},
 		{
-			name:          "both in past, candidate is older",
-			bestRate:      &Rate{Remaining: 0, Reset: uint64(past.Unix())},
-			candidateRate: &Rate{Remaining: 0, Reset: uint64(olderPast.Unix())},
-			wantNil:       true,
+			name: "both in past, second is older",
+			rates: []*Rate{
+				{Remaining: 0, Reset: uint64(past.Unix())},
+				{Remaining: 0, Reset: uint64(olderPast.Unix())},
+			},
+			wantIndex: 1,
 		},
 		{
-			name:          "both in past, best is older",
-			bestRate:      &Rate{Remaining: 0, Reset: uint64(olderPast.Unix())},
-			candidateRate: &Rate{Remaining: 0, Reset: uint64(past.Unix())},
-			wantNil:       true,
+			name: "both in past, first is older",
+			rates: []*Rate{
+				{Remaining: 0, Reset: uint64(olderPast.Unix())},
+				{Remaining: 0, Reset: uint64(past.Unix())},
+			},
+			wantIndex: 0,
 		},
 		{
-			name:          "best is nil, candidate has 0 remaining and future reset",
-			bestRate:      nil,
-			candidateRate: &Rate{Remaining: 0, Reset: uint64(future.Unix())},
-			wantNil:       true,
+			name:      "single candidate has 0 remaining and future reset",
+			rates:     []*Rate{{Remaining: 0, Reset: uint64(future.Unix())}},
+			wantIndex: -1,
 		},
 		{
-			name:          "both zero remaining and future resets",
-			bestRate:      &Rate{Remaining: 0, Reset: uint64(future.Unix())},
-			candidateRate: &Rate{Remaining: 0, Reset: uint64(future.Unix())},
-			wantNil:       true,
+			name: "both zero remaining and future resets",
+			rates: []*Rate{
+				{Remaining: 0, Reset: uint64(future.Add(time.Minute).Unix())},
+				{Remaining: 0, Reset: uint64(future.Unix())},
+			},
+			// Both are skipped when comparing against nil because neither is viable (0 rem, reset > now).
+			// So result is nil.
+			wantIndex: -1,
 		},
 		{
-			name:          "candidate reset in past, best in future (non-zero remaining)",
-			bestRate:      &Rate{Remaining: 100, Reset: uint64(future.Unix())},
-			candidateRate: &Rate{Remaining: 50, Reset: uint64(past.Unix())},
-			wantCandidate: true,
+			name: "second reset in past, first in future (non-zero remaining)",
+			rates: []*Rate{
+				{Remaining: 100, Reset: uint64(future.Unix())},
+				{Remaining: 50, Reset: uint64(past.Unix())},
+			},
+			wantIndex: 1,
 		},
 		{
-			name:          "best reset in past, candidate in future (non-zero remaining)",
-			bestRate:      &Rate{Remaining: 50, Reset: uint64(past.Unix())},
-			candidateRate: &Rate{Remaining: 75, Reset: uint64(future.Unix())},
-			wantCandidate: false,
+			name: "first reset in past, second in future (non-zero remaining)",
+			rates: []*Rate{
+				{Remaining: 50, Reset: uint64(past.Unix())},
+				{Remaining: 75, Reset: uint64(future.Unix())},
+			},
+			wantIndex: 0,
 		},
 		{
-			name:          "both in past, candidate is older (non-zero remaining)",
-			bestRate:      &Rate{Remaining: 30, Reset: uint64(past.Unix())},
-			candidateRate: &Rate{Remaining: 40, Reset: uint64(olderPast.Unix())},
-			wantCandidate: true,
+			name: "both in past, second is older (non-zero remaining)",
+			rates: []*Rate{
+				{Remaining: 30, Reset: uint64(past.Unix())},
+				{Remaining: 40, Reset: uint64(olderPast.Unix())},
+			},
+			wantIndex: 1,
 		},
 		{
-			name:          "both in past, best is older (non-zero remaining)",
-			bestRate:      &Rate{Remaining: 40, Reset: uint64(olderPast.Unix())},
-			candidateRate: &Rate{Remaining: 30, Reset: uint64(past.Unix())},
-			wantCandidate: false,
+			name: "both in past, first is older (non-zero remaining)",
+			rates: []*Rate{
+				{Remaining: 40, Reset: uint64(olderPast.Unix())},
+				{Remaining: 30, Reset: uint64(past.Unix())},
+			},
+			wantIndex: 0,
 		},
 		{
-			name:          "best is nil, candidate has remaining and future reset",
-			bestRate:      nil,
-			candidateRate: &Rate{Remaining: 25, Reset: uint64(future.Unix())},
-			wantCandidate: true,
+			name:      "single candidate has remaining and future reset",
+			rates:     []*Rate{{Remaining: 25, Reset: uint64(future.Unix())}},
+			wantIndex: 0,
 		},
 		{
-			name:          "both non-zero remaining and future resets",
-			bestRate:      &Rate{Remaining: 25, Reset: uint64(future.Unix())},
-			candidateRate: &Rate{Remaining: 50, Reset: uint64(future.Unix())},
-			wantCandidate: true,
+			name: "both non-zero remaining and future resets",
+			rates: []*Rate{
+				{Remaining: 25, Reset: uint64(future.Unix())},
+				{Remaining: 50, Reset: uint64(future.Unix())},
+			},
+			wantIndex: 1,
 		},
 		{
-			name:          "both future, candidate resets sooner with capacity",
-			bestRate:      &Rate{Remaining: 10, Reset: uint64(future.Add(30 * time.Minute).Unix())},
-			candidateRate: &Rate{Remaining: 5, Reset: uint64(future.Unix())},
-			wantCandidate: true,
+			name: "both future, second resets sooner with capacity",
+			rates: []*Rate{
+				{Remaining: 10, Reset: uint64(future.Add(30 * time.Minute).Unix())},
+				{Remaining: 5, Reset: uint64(future.Unix())},
+			},
+			wantIndex: 1,
 		},
 		{
-			name:          "both future, best resets sooner with capacity",
-			bestRate:      &Rate{Remaining: 5, Reset: uint64(future.Unix())},
-			candidateRate: &Rate{Remaining: 10, Reset: uint64(future.Add(30 * time.Minute).Unix())},
-			wantCandidate: false,
+			name: "both future, first resets sooner with capacity",
+			rates: []*Rate{
+				{Remaining: 5, Reset: uint64(future.Unix())},
+				{Remaining: 10, Reset: uint64(future.Add(30 * time.Minute).Unix())},
+			},
+			wantIndex: 0,
+		},
+		{
+			name: "equal remaining above threshold, second resets sooner",
+			rates: []*Rate{
+				{Remaining: 80, Reset: uint64(future.Add(30 * time.Minute).Unix())},
+				{Remaining: 80, Reset: uint64(future.Unix())},
+			},
+			wantIndex: 1,
+		},
+		{
+			name: "equal reset time, one exhausted, one has capacity",
+			rates: []*Rate{
+				{Remaining: 1400, Reset: uint64(future.Unix())},
+				{Remaining: 0, Reset: uint64(future.Unix())},
+			},
+			wantIndex: 0,
+		},
+		{
+			name: "3 candidates, ascending capacity, same reset",
+			rates: []*Rate{
+				{Remaining: 10, Reset: uint64(future.Unix())},
+				{Remaining: 20, Reset: uint64(future.Unix())},
+				{Remaining: 30, Reset: uint64(future.Unix())},
+			},
+			wantIndex: 2,
+		},
+		{
+			name: "3 candidates, middle has highest capacity, same reset",
+			rates: []*Rate{
+				{Remaining: 10, Reset: uint64(future.Unix())},
+				{Remaining: 50, Reset: uint64(future.Unix())},
+				{Remaining: 6, Reset: uint64(future.Unix())},
+			},
+			wantIndex: 1,
+		},
+		{
+			name: "3 candidates: exhausted, past(ready), capacity",
+			rates: []*Rate{
+				{Remaining: 0, Reset: uint64(future.Unix())},
+				{Remaining: 0, Reset: uint64(past.Unix())},
+				{Remaining: 10, Reset: uint64(future.Unix())},
+			},
+			wantIndex: 1,
+		},
+		{
+			name: "3 candidates: capacity/future, capacity/sooner, capacity/soonest",
+			rates: []*Rate{
+				{Remaining: 100, Reset: uint64(future.Add(30 * time.Minute).Unix())},
+				{Remaining: 100, Reset: uint64(future.Add(20 * time.Minute).Unix())},
+				{Remaining: 100, Reset: uint64(future.Add(10 * time.Minute).Unix())},
+			},
+			wantIndex: 2,
+		},
+		{
+			name: "4 candidates mixed",
+			rates: []*Rate{
+				{Remaining: 0, Reset: uint64(future.Unix())},                   // 0. Skip
+				{Remaining: 10, Reset: uint64(future.Add(time.Hour).Unix())},   // 1. Pick (Better than nil)
+				{Remaining: 10, Reset: uint64(future.Add(time.Minute).Unix())}, // 2. Pick (Sooner reset than 1)
+				{Remaining: 0, Reset: uint64(past.Unix())},                     // 3. Pick (Past reset better than future)
+			},
+			wantIndex: 3,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var best, candidate *Transport
-
-			if tt.bestRate != nil {
-				best = NewTransport(nil)
-				best.Limits.Store(nil, ResourceCore, tt.bestRate)
-			}
-			// If bestRate is nil, best stays nil, simulating first iteration or explicit nil
-
-			if tt.candidateRate != nil {
-				candidate = NewTransport(nil)
-				candidate.Limits.Store(nil, ResourceCore, tt.candidateRate)
-			} else {
-				// Candidate usually surely exists in the loop but for completeness
-				candidate = NewTransport(nil)
+			transports := make([]*Transport, len(tt.rates))
+			for i, r := range tt.rates {
+				tr := NewTransport(nil)
+				if r != nil {
+					tr.Limits.Store(nil, ResourceCore, r)
+				}
+				transports[i] = tr
 			}
 
-			// If we passed nil bestRate to simulate "no current best", we pass nil to function
-			var bestArg *Transport
-			if tt.bestRate != nil {
-				bestArg = best
+			var best *Transport
+			for _, tr := range transports {
+				best = StrategyResetTimeInPastAndMostRemaining(ResourceCore, best, tr)
 			}
 
-			got := StrategyResetTimeInPastAndMostRemaining(ResourceCore, bestArg, candidate)
-
-			if tt.wantNil {
-				if got != nil {
+			if tt.wantIndex == -1 {
+				if best != nil {
 					t.Errorf("wanted nil, got non-nil")
 				}
-				return
-			}
-
-			if tt.wantCandidate {
-				if got != candidate {
-					t.Errorf("wanted candidate, got best")
-				}
 			} else {
-				if got != bestArg {
-					t.Errorf("wanted best, got candidate")
+				if best == nil {
+					t.Fatalf("wanted index %d, got nil", tt.wantIndex)
+				}
+				if best != transports[tt.wantIndex] {
+					t.Errorf("wanted index %d, got different transport", tt.wantIndex)
 				}
 			}
 		})

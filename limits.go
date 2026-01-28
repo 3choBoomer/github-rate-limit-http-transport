@@ -115,7 +115,9 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 	if err != nil {
 		return fmt.Errorf("(http.RoundTripper).RoundTrip for %q failed: %w", u, err)
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		_ = Body.Close()
+	}(resp.Body)
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

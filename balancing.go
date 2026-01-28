@@ -12,9 +12,12 @@ import (
 // BalancingTransport distributes requests to the transport with the highest "remaining" rate limit to execute the request.
 // This can be used to distributes requests across multiple GitHub authentication tokens or applications.
 type BalancingTransport struct {
-	transports []*Transport
-	strategy   func(resource Resource, currentBest *Transport, candidate *Transport) *Transport
+	transports                  []*Transport
+	strategy                    func(resource Resource, currentBest *Transport, candidate *Transport) *Transport
+	getExhaustedErrorOrResponse GetTransportsExhaustedErrorOrResponse
 }
+
+type GetTransportsExhaustedErrorOrResponse func(req *http.Request, resource Resource, transports []*Transport) (*http.Response, error)
 
 // BalancingOption configures the BalancingTransport
 type BalancingOption func(*BalancingTransport)
@@ -35,6 +38,13 @@ func NewBalancingTransport(transports []*Transport, opts ...BalancingOption) *Ba
 func WithStrategy(strategy func(resource Resource, currentBest *Transport, candidate *Transport) *Transport) BalancingOption {
 	return func(bt *BalancingTransport) {
 		bt.strategy = strategy
+	}
+}
+
+// WithErrorOrResponseOnTransportsExhausted provide a function to return back a custom error when all transports are exhausted.
+func WithErrorOrResponseOnTransportsExhausted(errFunc GetTransportsExhaustedErrorOrResponse) BalancingOption {
+	return func(bt *BalancingTransport) {
+		bt.getExhaustedErrorOrResponse = errFunc
 	}
 }
 
@@ -63,9 +73,14 @@ func (bt *BalancingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	}
 
 	if bestTransport == nil {
+		if bt.getExhaustedErrorOrResponse != nil {
+			return bt.getExhaustedErrorOrResponse(req, resource, bt.transports)
+		}
 		bestTransport = bt.transports[rand.Intn(len(bt.transports))]
 	}
-
+	// if the strategy returned a transport, use it
+	// note that it could be exhausted,
+	// but the strategy may want the error to use elsewhere in the transport
 	return bestTransport.RoundTrip(req)
 }
 
@@ -78,22 +93,20 @@ func StrategyMostRemaining(resource Resource, best, candidate *Transport) *Trans
 	if candidateRem > bestRem {
 		return candidate
 	}
+
 	return best
 }
 
 // StrategyResetTimeInPastAndMostRemaining prefers transports whose reset is already in the past,
-// then earlier resets, and finally the one with the most remaining tokens. Returns nil when both// transports have zero remaining, signaling no immediate capacity.
+// then earlier resets, and finally the one with the most remaining tokens.
+// In real world usage, this strategy will favor transports that will reset sooner.
+// always returns one of the transports provided.
 func StrategyResetTimeInPastAndMostRemaining(resource Resource, best, candidate *Transport) *Transport {
 	bestRem, bestReset := extractValues(resource, best)
 	candidateRem, candidateReset := extractValues(resource, candidate)
 
-	// Fast path: both have zero remaining, no usable transport right now.
-	if bestRem == 0 && candidateRem == 0 {
-		return nil
-	}
-
-	// If one transport has already reset (reset time in the past) and the other hasn't,
-	// prefer the one that reset first because it can serve immediately.
+	// Prefer transports whose reset is already in the past
+	// relative to now because it will already have replenished tokens.
 	if resetIsInPastAndEarlierThanOther(candidateReset, bestReset) {
 		return candidate
 	}
@@ -101,20 +114,29 @@ func StrategyResetTimeInPastAndMostRemaining(resource Resource, best, candidate 
 		return best
 	}
 
-	// When both resets are in the future (or zero), prefer the earlier reset if it also has capacity.
-	if candidateReset != 0 && bestReset != 0 {
-		if candidateReset < bestReset && candidateRem > 0 {
+	// if both transports have zero remaining tokens
+	// return the one that will reset first
+	if bestRem == 0 && candidateRem == 0 {
+		if candidateReset < bestReset {
 			return candidate
 		}
-		if bestReset < candidateReset && bestRem > 0 {
-			return best
-		}
+		return best
+	}
+
+	// Prefer transports whose reset wil
+	// happen sooner if they both have capacity
+	if candidateRem > 0 && candidateReset < bestReset {
+		return candidate
+	}
+	if bestRem > 0 && bestReset < candidateReset {
+		return best
 	}
 
 	// Fallback to the transport with more remaining tokens.
 	if candidateRem > bestRem {
 		return candidate
 	}
+
 	return best
 }
 
