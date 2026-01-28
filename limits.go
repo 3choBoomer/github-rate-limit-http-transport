@@ -140,9 +140,6 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 	}
 
 	for resource, rate := range limits.Resources {
-		if resource == "core" {
-			fmt.Printf("Fetched rate limit for resource %q: %s\n", resource, rate.String())
-		}
 		l.Store(resp, resource, &rate)
 	}
 
