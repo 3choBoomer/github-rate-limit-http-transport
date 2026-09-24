@@ -9,43 +9,43 @@ import (
 type Resource string
 
 const (
-	// ResourceCore The core REST API's rate limit.
+	// The core REST API's rate limit.
 	ResourceCore Resource = "core"
 
-	// ResourceSearch Search API's rate limit.
+	// Search API's rate limit.
 	ResourceSearch Resource = "search"
 
-	// ResourceGraphQL GraphQL API's rate limit.
+	// GraphQL API's rate limit.
 	ResourceGraphQL Resource = "graphql"
 
-	// ResourceIntegrationManifest App manifest API's rate limit.
+	// App manifest API's rate limit.
 	ResourceIntegrationManifest Resource = "integration_manifest"
 
-	// ResourceSourceImport Import API's rate limit.
+	// Import API's rate limit.
 	ResourceSourceImport Resource = "source_import"
 
-	// ResourceCodeScanningUpload Code Scanning upload API's rate limit.
+	// Code Scanning upload API's rate limit.
 	ResourceCodeScanningUpload Resource = "code_scanning_upload"
 
-	// ResourceCodeScanningAutofix Code Scanning autofix API's rate limit.
+	// Code Scanning autofix API's rate limit.
 	ResourceCodeScanningAutofix Resource = "code_scanning_autofix"
 
-	// ResourceActionsRunnerRegistration Actions Runner Registration API's rate limit.
+	// Actions Runner Registration API's rate limit.
 	ResourceActionsRunnerRegistration Resource = "actions_runner_registration"
 
-	// ResourceSCIM SCIM API's rate limit.
+	// SCIM API's rate limit.
 	ResourceSCIM Resource = "scim"
 
-	// ResourceDependencySnapshots Dependency Snapshots API's rate limit.
+	// Dependency Snapshots API's rate limit.
 	ResourceDependencySnapshots Resource = "dependency_snapshots"
 
-	// ResourceAuditLog Audit Log API's rate limit.
+	// Audit Log API's rate limit.
 	ResourceAuditLog Resource = "audit_log"
 
-	// ResourceAuditLogStreaming Audit Log Streaming API's rate limit.
+	// Audit Log Streaming API's rate limit.
 	ResourceAuditLogStreaming Resource = "audit_log_streaming"
 
-	// ResourceCodeSearch Code Search API's rate limit.
+	// Code Search API's rate limit.
 	ResourceCodeSearch Resource = "code_search"
 )
 

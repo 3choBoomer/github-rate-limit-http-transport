@@ -22,13 +22,15 @@ var DefaultURL = &url.URL{
 
 // Limits represents the rate limits for all known resource types.
 type Limits struct {
-	m sync.Map
+	m sync.Map // Resource -> *Rate
 	// Notify is called when a new rate limit is stored.
 	// It can be a useful hook to update metric gauges.
 	Notify func(*http.Response, Resource, *Rate)
 }
 
-// Store the rate limit for the given resource type.
+// Store the rate limit for the given resource type unconditionally, overwriting any existing
+// value. Callers that need to filter out stale or out-of-order updates before they reach Store
+// are responsible for doing so themselves (see (*Limits).Fetch).
 func (l *Limits) Store(resp *http.Response, resource Resource, rate *Rate) {
 	l.m.Store(resource, rate)
 	if l.Notify != nil {
@@ -47,6 +49,29 @@ func (l *Limits) Load(resource Resource) *Rate {
 		return nil
 	}
 	return r
+}
+
+// Reserve proactively decrements the Remaining count (and increments Used) by one for the given resource, if known.
+// This is useful to optimistically account for an in-flight request before its response (and updated rate-limit
+// headers) has been received, to avoid a burst of concurrent requests overrunning the actual rate limit.
+// A CompareAndSwap loop is used so concurrent calls don't lose updates to one another.
+// Unlike Store, this does not invoke Notify, since the estimate is superseded by the real rate limit once available.
+func (l *Limits) Reserve(resource Resource) {
+	for {
+		rate := l.Load(resource)
+		if rate == nil || rate.Remaining == 0 {
+			return
+		}
+		updated := &Rate{
+			Limit:     rate.Limit,
+			Used:      rate.Used + 1,
+			Remaining: rate.Remaining - 1,
+			Reset:     rate.Reset,
+		}
+		if l.m.CompareAndSwap(resource, rate, updated) {
+			return
+		}
+	}
 }
 
 // Iter loops over the resource types and yields each resource type and its rate limit.
@@ -115,9 +140,7 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 	if err != nil {
 		return fmt.Errorf("(http.RoundTripper).RoundTrip for %q failed: %w", u, err)
 	}
-	defer func(Body io.ReadCloser) {
-		_ = Body.Close()
-	}(resp.Body)
+	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -140,6 +163,17 @@ func (l *Limits) Fetch(ctx context.Context, transport http.RoundTripper, u *url.
 	}
 
 	for resource, rate := range limits.Resources {
+		// The /rate_limit endpoint's response can itself be stale (e.g. served from a cache or a
+		// lagging replica), reporting remaining == limit (used == 0) even though live traffic has
+		// already been consuming the resource. Trust that "full quota" reading only when there's no
+		// fresher evidence to the contrary: either nothing is stored yet, or the stored window has
+		// already expired. A reading that shows actual consumption (remaining < limit) proves it
+		// reflects real usage, so it's always safe to store regardless of what's already known.
+		if rate.Remaining >= rate.Limit {
+			if existing := l.Load(resource); existing != nil && !existing.expired() {
+				continue
+			}
+		}
 		l.Store(resp, resource, &rate)
 	}
 
