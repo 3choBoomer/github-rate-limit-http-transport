@@ -39,15 +39,15 @@ func TestBalancingTransport_RoundTrip(t *testing.T) {
 
 	t.Run("selects transport with highest remaining limit", func(t *testing.T) {
 		m1 := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
-		t1 := NewTransport(m1)
+		t1 := &Transport{Base: m1}
 		t1.Limits.Store(nil, ResourceCore, &Rate{Remaining: 10})
 
 		m2 := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
-		t2 := NewTransport(m2)
+		t2 := &Transport{Base: m2}
 		t2.Limits.Store(nil, ResourceCore, &Rate{Remaining: 100}) // Highest
 
 		m3 := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
-		t3 := NewTransport(m3)
+		t3 := &Transport{Base: m3}
 		t3.Limits.Store(nil, ResourceCore, &Rate{Remaining: 50})
 
 		bt := NewBalancingTransport([]*Transport{t1, t2, t3})
@@ -73,10 +73,10 @@ func TestBalancingTransport_RoundTrip(t *testing.T) {
 
 	t.Run("fallbacks to random when no limits known", func(t *testing.T) {
 		m1 := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
-		t1 := NewTransport(m1)
+		t1 := &Transport{Base: m1}
 
 		m2 := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
-		t2 := NewTransport(m2)
+		t2 := &Transport{Base: m2}
 
 		bt := NewBalancingTransport([]*Transport{t1, t2})
 
@@ -101,11 +101,11 @@ func TestBalancingTransport_RoundTrip(t *testing.T) {
 	t.Run("handles mixed known and unknown limits", func(t *testing.T) {
 		// Transport 1: no info
 		m1 := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
-		t1 := NewTransport(m1)
+		t1 := &Transport{Base: m1}
 
 		// Transport 2: 10 remaining
 		m2 := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
-		t2 := NewTransport(m2)
+		t2 := &Transport{Base: m2}
 		t2.Limits.Store(nil, ResourceCore, &Rate{Remaining: 10})
 
 		bt := NewBalancingTransport([]*Transport{t1, t2})
@@ -136,12 +136,12 @@ func TestBalancingTransport_RoundTrip(t *testing.T) {
 		searchReq, _ := http.NewRequest("GET", "https://api.github.com/search/users?q=foo", nil)
 
 		m1 := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
-		t1 := NewTransport(m1)
+		t1 := &Transport{Base: m1}
 		t1.Limits.Store(nil, ResourceCore, &Rate{Remaining: 100})  // high core
 		t1.Limits.Store(nil, ResourceSearch, &Rate{Remaining: 10}) // low search
 
 		m2 := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
-		t2 := NewTransport(m2)
+		t2 := &Transport{Base: m2}
 		t2.Limits.Store(nil, ResourceCore, &Rate{Remaining: 10})    // low core
 		t2.Limits.Store(nil, ResourceSearch, &Rate{Remaining: 100}) // high search
 
@@ -187,8 +187,8 @@ func TestBalancingTransport_Poll(t *testing.T) {
 	// I can modify the test to return a body.
 
 	bt := NewBalancingTransport([]*Transport{
-		NewTransport(mockTransport),
-		NewTransport(mockTransport),
+		&Transport{Base: mockTransport},
+		&Transport{Base: mockTransport},
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -233,7 +233,7 @@ func TestNewBalancingTransport(t *testing.T) {
 		}
 
 		m := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
-		bt := NewBalancingTransport([]*Transport{NewTransport(m)}, WithStrategy(customStrategy))
+		bt := NewBalancingTransport([]*Transport{&Transport{Base: m}}, WithStrategy(customStrategy))
 
 		req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
 		_, _ = bt.RoundTrip(req)
@@ -265,7 +265,7 @@ func TestNewBalancingTransport(t *testing.T) {
 		}
 
 		m := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
-		bt := NewBalancingTransport([]*Transport{NewTransport(m)},
+		bt := NewBalancingTransport([]*Transport{&Transport{Base: m}},
 			WithStrategy(strategy),
 			WithErrorOrResponseOnTransportsExhausted(getEarliestResetError))
 
@@ -286,7 +286,7 @@ func TestNewBalancingTransport(t *testing.T) {
 		}
 
 		m := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
-		bt := NewBalancingTransport([]*Transport{NewTransport(m)}, WithStrategy(strategy), WithErrorOrResponseOnTransportsExhausted(returnNil))
+		bt := NewBalancingTransport([]*Transport{&Transport{Base: m}}, WithStrategy(strategy), WithErrorOrResponseOnTransportsExhausted(returnNil))
 
 		req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
 		resp, err := bt.RoundTrip(req)
@@ -303,10 +303,10 @@ func TestNewBalancingTransport(t *testing.T) {
 		earliest := now.Add(10 * time.Minute)
 		latest := now.Add(20 * time.Minute)
 
-		t1 := NewTransport(nil)
+		t1 := &Transport{Base: nil}
 		t1.Limits.Store(nil, ResourceCore, &Rate{Remaining: 0, Reset: uint64(latest.Unix())})
 
-		t2 := NewTransport(nil)
+		t2 := &Transport{Base: nil}
 		t2.Limits.Store(nil, ResourceCore, &Rate{Remaining: 0, Reset: uint64(earliest.Unix())})
 
 		errWithReset := &exhaustedWithReset{msg: "exhausted"}
@@ -342,7 +342,7 @@ func TestNewBalancingTransport(t *testing.T) {
 		}
 
 		m := &mockBalancingRoundTripper{resp: &http.Response{StatusCode: 200}}
-		bt := NewBalancingTransport([]*Transport{NewTransport(m)}, WithStrategy(strategy), WithErrorOrResponseOnTransportsExhausted(exhaustedResponder))
+		bt := NewBalancingTransport([]*Transport{&Transport{Base: m}}, WithStrategy(strategy), WithErrorOrResponseOnTransportsExhausted(exhaustedResponder))
 
 		req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
 		gotResp, err := bt.RoundTrip(req)
@@ -367,9 +367,6 @@ type exhaustedWithReset struct {
 func (e *exhaustedWithReset) Error() string                { return e.msg }
 func (e *exhaustedWithReset) SetEarliestReset(t time.Time) { e.earliestReset = t }
 func (e *exhaustedWithReset) GetEarliestReset() time.Time  { return e.earliestReset }
-
-// Ensure mockRoundTripper implements http.RoundTripper
-var _ http.RoundTripper = &mockRoundTripper{}
 
 func TestStrategy_BestTransportByRemainingAndReset(t *testing.T) {
 	now := time.Now()
@@ -579,7 +576,7 @@ func TestStrategy_BestTransportByRemainingAndReset(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			transports := make([]*Transport, len(tt.rates))
 			for i, r := range tt.rates {
-				tr := NewTransport(nil)
+				tr := &Transport{Base: nil}
 				if r != nil {
 					tr.Limits.Store(nil, ResourceCore, r)
 				}
